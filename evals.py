@@ -48,7 +48,7 @@ class Evaluator:
             hit += (pred == label).sum().item()
         acc = hit / total
         return acc
-################################ </Evaluator_Last_Token> ################################ 
+################################ </Evaluator_Last_Token> ###############################
 
 ################################ <Evaluator_Perplexity> ################################ 
 

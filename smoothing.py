@@ -13,6 +13,11 @@ from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRMS
 #     MixtralRMSNorm,
 # )
 from transformers.models.falcon.modeling_falcon import FalconDecoderLayer
+def logsumexp_magnitude(x, beta=4):
+    # if isinstance(x, torch.Tensor):
+    #     x = x.detach().cpu().numpy() 
+    m = torch.max(torch.abs(x), dim=0)[0]
+    return (1.0 / beta) * (m + torch.log(torch.sum(torch.exp(beta * (x - m)), dim=0)))
 
 def get_act_masks(act_scales, threshold=1, perc=0.1):
 
@@ -49,32 +54,60 @@ def get_act_masks(act_scales, threshold=1, perc=0.1):
     #                     torch.zeros_like(x),   # inside → 0
     #                     torch.ones_like(x))    # outside → 1
     
-    mask = torch.where((x >= lower_fence_2) & (x <= upper_fence_2),
+    act_mask = torch.where((x >= lower_fence_2) & (x <= upper_fence_2),
                         torch.zeros_like(x),   # inside → 0
                         torch.ones_like(x))    # outside → 1
 
         # act_masks[key] = mask
+    act_scales_new = torch.where((x >= lower_fence_2) & (x <= upper_fence_2),
+                        torch.full_like(x, upper_fence_2), 
+                        x)
+    # masked_scales = torch.where(masks == 0, torch.full_like(masked_scales, 1e-5), masked_scales)
+    return act_mask, act_scales_new
 
-    return mask
+def get_weight_masks(act_mask, w, threshold=1, perc=0.1): 
+
+    median_val = w.median().item() 
+    lower_fence_2 = (median_val) - (perc *median_val)
+    upper_fence_2 = (median_val) + (perc *median_val) 
+    w_modified = torch.where(act_mask == 0, torch.tensor(lower_fence_2, dtype=w.dtype, device=w.device), w)
+
+    return w_modified 
+
 
 @torch.no_grad()
-def smooth_ln_fcs(ln, fcs, act_scales, alpha=0.5, masking=False, r=1, perc=0.1):
+def smooth_ln_fcs(ln, fcs, act_scales, alpha=0.5, masking=False, r=1, perc=0.1, BETA=1):
     if not isinstance(fcs, list):
         fcs = [fcs]
     assert isinstance(ln, nn.LayerNorm)
     for fc in fcs:
         assert isinstance(fc, nn.Linear)
+        # print(f"ln.weight.numel(): {ln.weight.numel()} || fc.in_features: {fc.in_features} || act_scales.numel(): {act_scales.numel()}")
+        # print(f"fc.in_features: {fc.in_features}")
+        # print(f"act_scales.numel(): {act_scales.numel()}")
         assert ln.weight.numel() == fc.in_features == act_scales.numel()
 
     device, dtype = fcs[0].weight.device, fcs[0].weight.dtype
     act_scales = act_scales.to(device=device, dtype=dtype)
     
     # masks = masks.to(device=device, dtype=dtype)
+    ####
     weight_scales = torch.cat(
         [fc.weight.abs().max(dim=0, keepdim=True)[0] for fc in fcs], dim=0
     )
+    print(f"0. weight_scale.shape: {weight_scales.shape}")
     weight_scales = weight_scales.max(dim=0)[0].clamp(min=1e-5)
-
+    print(f"1. weight_scale.shape: {weight_scales.shape}")
+    #####
+    # weight_scales_ = torch.cat(
+    #     [fc.weight.abs() for fc in fcs], dim=0
+    # )
+    # print(f"3. weight_scale.shape: {weight_scales_.shape}")
+    # weight_scales = logsumexp_magnitude(weight_scales_, BETA)
+    # weight_scales = weight_scales.clamp(min=1e-5)
+    # print(f"4. weight_scale.shape: {weight_scales.shape}")
+    print("===========================")
+    #####
     scales = (
         (act_scales.pow(alpha) / weight_scales.pow(1 - alpha))
         .clamp(min=1e-5)
@@ -83,9 +116,14 @@ def smooth_ln_fcs(ln, fcs, act_scales, alpha=0.5, masking=False, r=1, perc=0.1):
     )
     
     if masking:
-        masks = get_act_masks(act_scales, threshold=r, perc=perc) 
-        act_scales_masked = torch.where(masks == 0, torch.ones_like(act_scales), act_scales)
-        weight_scales_masked = torch.where(masks == 0, torch.ones_like(weight_scales), weight_scales)
+        # masks, _ = get_act_masks(act_scales, threshold=r, perc=perc) 
+        # act_scales_masked = torch.where(masks == 0, torch.ones_like(act_scales), act_scales)
+        # weight_scales_masked = torch.where(masks == 0, torch.ones_like(weight_scales), weight_scales)
+
+        # weight_scales_masked = weight_scales
+        act_mask, act_scales_masked = get_act_masks(act_scales, threshold=r, perc=perc) 
+        weight_scales_masked = get_weight_masks(act_mask, weight_scales)
+        
         masked_scales = (
             (act_scales_masked.pow(alpha) / weight_scales_masked.pow(1 - alpha))
             .clamp(min=1e-5)
@@ -152,7 +190,11 @@ def smooth_ln_fcs_llama_like(ln, fcs, act_scales, alpha=0.5, masking=False, r=1)
 
 
 @torch.no_grad()
-def smooth_lm(model, scales, alpha=0.5, masking=False, r=1, perc=0.1):
+def smooth_lm(model, scales, alpha=0.5, masking=False, r=1, perc=0.005, BETA=1):
+    scales_ = {} 
+    for k, v in scales.items():
+        scales_[k] = torch.tensor(v) 
+    scales = scales_
     for name, module in model.named_modules():
         if isinstance(module, OPTDecoderLayer):
             attn_ln = module.self_attn_layer_norm
@@ -163,13 +205,13 @@ def smooth_lm(model, scales, alpha=0.5, masking=False, r=1, perc=0.1):
             ]
             qkv_input_scales = scales[name + ".self_attn.q_proj"]
             # qkv_input_masks = masks[name + ".self_attn.q_proj"]
-            smooth_ln_fcs(attn_ln, qkv, qkv_input_scales, alpha, masking, r, perc)
+            smooth_ln_fcs(attn_ln, qkv, qkv_input_scales, alpha, masking, r, perc, BETA)
 
             ffn_ln = module.final_layer_norm
             fc1 = module.fc1
             fc1_input_scales = scales[name + ".fc1"]
             # fc1_input_masks = masks[name + ".fc1"]
-            smooth_ln_fcs(ffn_ln, fc1, fc1_input_scales, alpha, masking, r, perc)
+            smooth_ln_fcs(ffn_ln, fc1, fc1_input_scales, alpha, masking, r, perc, BETA)
         # elif isinstance(module, BloomBlock):
         #     attn_ln = module.input_layernorm
         #     qkv = module.self_attention.query_key_value
